@@ -289,6 +289,7 @@ tr:hover .warn-c{background:#fff3cd!important}
       </div>
       <div class="pg-actions">
         <span class="badge">Live Planning</span>
+        <span id="fb-indicator" style="font-size:10px;color:#adb5bd;padding:3px 8px;border:1px solid #e2e6ea;border-radius:6px;background:#fff;cursor:pointer" onclick="showFbMenu()" title="Firebase sync status">☁ Firebase</span>
         <span id="persist-status" style="font-size:10px;color:#6c757d;padding:3px 8px;border:1px solid #e2e6ea;border-radius:6px;background:#fff;cursor:pointer" onclick="showPersistMenu()" title="Klik untuk manage data tersimpan">💾 —</span>
         <span style="font-size:10px;color:#6c757d;padding:3px 8px;border:1px solid #e2e6ea;border-radius:6px;background:#fff">APR W3 2026</span>
       </div>
@@ -297,6 +298,9 @@ tr:hover .warn-c{background:#fff3cd!important}
   </div>
 </div>
 
+<!-- Firebase SDK (compat v10) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script>
@@ -3643,6 +3647,244 @@ const PERSIST_KEYS = {
   resNextId     : 'ppic_resnextid',
 };
 
+
+// ═══════════════════════════════════════════
+// FIREBASE / FIRESTORE INTEGRATION
+// ═══════════════════════════════════════════
+const FB_CONFIG = {
+  apiKey           : "AIzaSyDXzGvONgKCHwcWO02RVVjRqfPyClhejFs",
+  authDomain       : "production-planner-aba2d.firebaseapp.com",
+  projectId        : "production-planner-aba2d",
+  storageBucket    : "production-planner-aba2d.firebasestorage.app",
+  messagingSenderId: "887519374856",
+  appId            : "1:887519374856:web:2b25218f9509789545abbd",
+};
+
+let fbApp = null;
+let fbDb  = null;
+let fbEnabled = false;
+let fbSyncing = false;
+const FB_DOC_ROOT = 'ppic';           // Firestore collection
+const FB_CHUNK    = 400;              // items per chunk doc (stay under 1MB)
+
+// Keys → Firestore doc name mapping
+const FB_KEY_MAP = {
+  SKUS            : 'skus',
+  RES_FG_DATA     : 'resfg',
+  RES_SF_DATA     : 'ressf',
+  BOM_DATA        : 'bom',
+  FC_DATA         : 'fc',
+  GBJD_STOCK      : 'gbjd',
+  SCHED_ROWS      : 'schedrows',
+  SCHED_MIX_ROWS  : 'schedmix',
+  WORK_HOURS      : 'workhours',
+  OT_CONFIG       : 'otconfig',
+  API_CONNECTIONS : 'apiconn',
+  projVersionPerSku: 'projver',
+  FG_WIP_MAP      : 'wipmap',
+  PLAN_STOCK      : 'planstock',
+  SUGGEST_PENDING : 'suggestpending',
+};
+
+function fbInit() {
+  try {
+    if (fbApp) return true;
+    fbApp     = firebase.initializeApp(FB_CONFIG);
+    fbDb      = firebase.firestore(fbApp);
+    fbEnabled = true;
+    console.log('[Firebase] Initialized OK');
+    updateFbStatus('connected');
+    return true;
+  } catch(e) {
+    console.warn('[Firebase] Init failed:', e.message);
+    fbEnabled = false;
+    updateFbStatus('error', e.message);
+    return false;
+  }
+}
+
+function updateFbStatus(state, msg) {
+  const el = document.getElementById('fb-status');
+  if (!el) return;
+  const states = {
+    connected  : {dot:'#2ECC71', text:'Firebase connected', bg:'#e8f5e9', color:'#1b5e20'},
+    syncing    : {dot:'#F39C12', text:'Syncing…',           bg:'#fff3e0', color:'#e65100'},
+    error      : {dot:'#E74C3C', text:'Firebase error',     bg:'#FCEBEB', color:'#b71c1c'},
+    offline    : {dot:'#adb5bd', text:'Offline (localStorage only)', bg:'#f8f9fa', color:'#6c757d'},
+  };
+  const s = states[state] || states.offline;
+  el.style.background   = s.bg;
+  el.style.color        = s.color;
+  el.style.borderColor  = s.dot;
+  el.innerHTML = '<span style="width:7px;height:7px;border-radius:50%;background:'+s.dot+';display:inline-block;margin-right:5px;vertical-align:middle"></span>'+
+    s.text + (msg ? ': '+msg.slice(0,60) : '');
+}
+
+// Serialize value — handle large arrays by chunking
+async function fbWrite(key, value) {
+  if (!fbEnabled || !fbDb) return;
+  const docName = FB_KEY_MAP[key] || key;
+  const col = fbDb.collection(FB_DOC_ROOT);
+
+  try {
+    if (Array.isArray(value) && value.length > FB_CHUNK) {
+      // Chunked write
+      const chunkCount = Math.ceil(value.length / FB_CHUNK);
+      // Delete old extra chunks first (best effort)
+      for (let ci = 0; ci < 30; ci++) {
+        try { await col.doc(docName+'_chunk_'+ci).delete(); } catch(e) {}
+        if (ci >= chunkCount) break;
+      }
+      for (let ci = 0; ci < chunkCount; ci++) {
+        const chunk = value.slice(ci * FB_CHUNK, (ci+1) * FB_CHUNK);
+        await col.doc(docName+'_chunk_'+ci).set({
+          _chunk: true, _ci: ci, _total: chunkCount, data: chunk
+        });
+      }
+      // Index doc
+      await col.doc(docName).set({_chunked: true, _total: chunkCount, _len: value.length, _ts: Date.now()});
+    } else {
+      await col.doc(docName).set({data: value, _ts: Date.now()});
+    }
+  } catch(e) {
+    console.warn('[Firebase] Write error for', key, ':', e.message);
+  }
+}
+
+async function fbRead(key) {
+  if (!fbEnabled || !fbDb) return null;
+  const docName = FB_KEY_MAP[key] || key;
+  const col = fbDb.collection(FB_DOC_ROOT);
+  try {
+    const snap = await col.doc(docName).get();
+    if (!snap.exists) return null;
+    const d = snap.data();
+    if (d._chunked) {
+      // Read all chunks
+      const chunks = [];
+      for (let ci = 0; ci < d._total; ci++) {
+        const cs = await col.doc(docName+'_chunk_'+ci).get();
+        if (cs.exists) chunks.push(...cs.data().data);
+      }
+      return chunks;
+    }
+    return d.data !== undefined ? d.data : d;
+  } catch(e) {
+    console.warn('[Firebase] Read error for', key, ':', e.message);
+    return null;
+  }
+}
+
+async function fbSaveAll() {
+  if (!fbEnabled) { alert('Firebase tidak terhubung.'); return; }
+  updateFbStatus('syncing');
+  fbSyncing = true;
+  updateFbIndicator();
+  try {
+    const dataMap = {
+      SKUS, RES_FG_DATA, RES_SF_DATA, BOM_DATA, FC_DATA,
+      GBJD_STOCK, SCHED_ROWS, SCHED_MIX_ROWS,
+      WORK_HOURS, OT_CONFIG, API_CONNECTIONS,
+      projVersionPerSku, FG_WIP_MAP, PLAN_STOCK, SUGGEST_PENDING,
+    };
+    for (const [key, val] of Object.entries(dataMap)) {
+      await fbWrite(key, val);
+    }
+    const ts = new Date().toLocaleTimeString('id-ID');
+    localStorage.setItem('fb_last_push', ts);
+    updateFbStatus('connected');
+    fbSyncing = false;
+    updateFbIndicator();
+    alert('✓ Semua data berhasil diupload ke Firebase (' + ts + ')');
+  } catch(e) {
+    updateFbStatus('error', e.message);
+    fbSyncing = false;
+    updateFbIndicator();
+  }
+}
+
+async function fbLoadAll() {
+  if (!fbEnabled) { alert('Firebase tidak terhubung.'); return; }
+  if (!confirm('Load semua data dari Firebase?\nData lokal akan ditimpa.')) return;
+  updateFbStatus('syncing');
+  fbSyncing = true;
+  updateFbIndicator();
+
+  try {
+    const keys = Object.keys(FB_KEY_MAP);
+    let loaded = 0;
+
+    for (const key of keys) {
+      const val = await fbRead(key);
+      if (val === null) continue;
+      loaded++;
+      switch(key) {
+        case 'SKUS':             SKUS.splice(0,SKUS.length,...(Array.isArray(val)?val:[])); break;
+        case 'RES_FG_DATA':      RES_FG_DATA.splice(0,RES_FG_DATA.length,...(Array.isArray(val)?val:[])); break;
+        case 'RES_SF_DATA':      RES_SF_DATA.splice(0,RES_SF_DATA.length,...(Array.isArray(val)?val:[])); break;
+        case 'BOM_DATA':         BOM_DATA.splice(0,BOM_DATA.length,...(Array.isArray(val)?val:[])); break;
+        case 'FC_DATA':          FC_DATA.splice(0,FC_DATA.length,...(Array.isArray(val)?val:[])); break;
+        case 'SCHED_ROWS':       SCHED_ROWS.splice(0,SCHED_ROWS.length,...(Array.isArray(val)?val:[])); break;
+        case 'SCHED_MIX_ROWS':   SCHED_MIX_ROWS.splice(0,SCHED_MIX_ROWS.length,...(Array.isArray(val)?val:[])); break;
+        case 'API_CONNECTIONS':  API_CONNECTIONS.splice(0,API_CONNECTIONS.length,...(Array.isArray(val)?val:[])); break;
+        case 'GBJD_STOCK':       Object.assign(GBJD_STOCK, val||{}); break;
+        case 'WORK_HOURS':       Object.keys(val||{}).forEach(k=>{if(WORK_HOURS[k])Object.assign(WORK_HOURS[k],val[k]);}); break;
+        case 'OT_CONFIG':        Object.assign(OT_CONFIG, val||{}); break;
+        case 'projVersionPerSku':Object.assign(projVersionPerSku, val||{}); break;
+        case 'FG_WIP_MAP':       Object.assign(FG_WIP_MAP, val||{}); break;
+        case 'PLAN_STOCK':       Object.assign(PLAN_STOCK, val||{}); break;
+        case 'SUGGEST_PENDING':  SUGGEST_PENDING.splice(0,SUGGEST_PENDING.length,...(Array.isArray(val)?val:[])); break;
+      }
+      // Mirror to localStorage
+      localStorage.setItem(PERSIST_KEYS[key]||('ppic_'+key.toLowerCase()), JSON.stringify(val));
+    }
+
+    const ts = new Date().toLocaleTimeString('id-ID');
+    localStorage.setItem('fb_last_pull', ts);
+    updateFbStatus('connected');
+    fbSyncing = false;
+    updateFbIndicator();
+    alert('✓ '+loaded+' collections diload dari Firebase.\nHalaman akan di-refresh.');
+    go(curPage);
+  } catch(e) {
+    updateFbStatus('error', e.message);
+    fbSyncing = false;
+    updateFbIndicator();
+    console.error('[Firebase] Load error:', e);
+  }
+}
+
+// Auto-push to Firebase on every persistSave (background, non-blocking)
+async function fbAutoSync(keys) {
+  if (!fbEnabled || fbSyncing) return;
+  const dataRef = {
+    SKUS, RES_FG_DATA, RES_SF_DATA, BOM_DATA, FC_DATA,
+    GBJD_STOCK, SCHED_ROWS, SCHED_MIX_ROWS, WORK_HOURS, OT_CONFIG,
+    API_CONNECTIONS, projVersionPerSku, FG_WIP_MAP, PLAN_STOCK, SUGGEST_PENDING,
+  };
+  for (const key of keys) {
+    if (dataRef[key] !== undefined) {
+      fbWrite(key, dataRef[key]); // fire and forget
+    }
+  }
+}
+
+function updateFbIndicator() {
+  const el = document.getElementById('fb-indicator');
+  if (!el) return;
+  if (fbSyncing) {
+    el.textContent = '☁ Syncing…';
+    el.style.color = '#e65100';
+  } else if (fbEnabled) {
+    const ts = localStorage.getItem('fb_last_push') || '—';
+    el.textContent = '☁ Firebase ' + ts;
+    el.style.color = '#2e7d32';
+  } else {
+    el.textContent = '☁ Firebase offline';
+    el.style.color = '#adb5bd';
+  }
+}
+
 function persistSave(keys) {
   if(!Array.isArray(keys)) keys=[keys];
   try {
@@ -3653,13 +3895,14 @@ function persistSave(keys) {
         k==='BOM_DATA'?BOM_DATA:k==='RESOURCE_DATA'?RESOURCE_DATA:k==='LINE_ASSIGN'?LINE_ASSIGN:
         k==='SKUS'?SKUS:k==='SCHED_ROWS'?SCHED_ROWS:k==='PERIODS'?PERIODS:
         k==='bomNextId'?bomNextId:k==='laNextId'?laNextId:resNextId;
-      const serialized = (k==='GBJD_STOCK') ? JSON.stringify(val) : JSON.stringify(val);
-      localStorage.setItem(PERSIST_KEYS[k], serialized);
+        localStorage.setItem(PERSIST_KEYS[k], JSON.stringify(val));
     });
     const now=new Date();
     const ts=String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0');
     localStorage.setItem('ppic_lastsave', ts);
     updatePersistStatus();
+    // Background Firebase sync
+    try { fbAutoSync(keys); } catch(e2) {}
   } catch(e) {
     if(e.name==='QuotaExceededError') console.warn('localStorage penuh — data terlalu besar, tidak tersimpan.');
     else console.warn('persistSave error:', e);
@@ -3720,6 +3963,48 @@ function persistLoad() {
 function persistClearKey(key) {
   localStorage.removeItem(PERSIST_KEYS[key]);
   updatePersistStatus();
+}
+
+function showFbMenu() {
+  document.getElementById('persist-overlay-bg')?.remove();
+  document.getElementById('persist-menu-popup')?.remove();
+
+  const bg = document.createElement('div');
+  bg.id = 'persist-overlay-bg';
+  bg.style.cssText = 'position:fixed;inset:0;z-index:9998';
+  bg.onclick = () => { bg.remove(); document.getElementById('persist-menu-popup')?.remove(); };
+  document.body.appendChild(bg);
+
+  const lastPush = localStorage.getItem('fb_last_push') || '—';
+  const lastPull = localStorage.getItem('fb_last_pull') || '—';
+
+  const menu = document.createElement('div');
+  menu.id = 'persist-menu-popup';
+  menu.className = 'persist-menu';
+  menu.style.cssText += 'min-width:280px';
+  menu.innerHTML =
+    '<h4>☁ Firebase Firestore</h4>'+
+    '<div id="fb-status" style="font-size:10px;padding:5px 8px;border-radius:6px;border:1px solid #e2e6ea;margin-bottom:10px">Menghubungkan…</div>'+
+    '<div style="font-size:10px;color:#6c757d;margin-bottom:8px">'+
+      'Last push: <strong>'+lastPush+'</strong><br>'+
+      'Last pull: <strong>'+lastPull+'</strong>'+
+    '</div>'+
+    '<div style="display:flex;flex-direction:column;gap:6px">'+
+      '<button onclick="fbSaveAll()" style="padding:7px 12px;border:1px solid #a5d6a7;border-radius:6px;font-size:11px;cursor:pointer;background:#e8f5e9;color:#1b5e20;font-family:inherit;font-weight:600">⬆ Push semua data ke Firebase</button>'+
+      '<button onclick="fbLoadAll()" style="padding:7px 12px;border:1px solid #B5D4F4;border-radius:6px;font-size:11px;cursor:pointer;background:#e3f2fd;color:#0d47a1;font-family:inherit;font-weight:600">⬇ Pull semua data dari Firebase</button>'+
+      '<hr style="border:none;border-top:1px solid #e2e6ea;margin:2px 0">'+
+      '<button onclick="document.getElementById(\'persist-menu-popup\')?.remove();document.getElementById(\'persist-overlay-bg\')?.remove();showPersistMenu()" style="padding:7px 12px;border:1px solid #e2e6ea;border-radius:6px;font-size:11px;cursor:pointer;background:#fff;font-family:inherit">💾 Manage localStorage</button>'+
+      '<button onclick="document.getElementById(\'persist-menu-popup\')?.remove();document.getElementById(\'persist-overlay-bg\')?.remove()" style="padding:7px 12px;border:1px solid #ced4da;border-radius:6px;font-size:11px;cursor:pointer;background:#fff;font-family:inherit">Tutup</button>'+
+    '</div>';
+  document.body.appendChild(menu);
+
+  // Try init Firebase and show status
+  if (fbInit()) {
+    updateFbStatus('connected');
+  } else {
+    updateFbStatus('offline');
+  }
+  updateFbIndicator();
 }
 
 function persistClearAll() {
@@ -3785,8 +4070,153 @@ function showPersistMenu() {
 }
 
 // Load saved data before rendering
-persistLoad();
-updatePersistStatus();
+// ── Startup: Firebase first, localStorage fallback ──
+async function startupLoad() {
+  const pg = document.getElementById('pg-body');
+  const setStatus = function(icon, title, sub, color) {
+    if (!pg) return;
+    pg.innerHTML = '<div style="text-align:center;padding:60px 20px;color:'+color+'">'
+      + '<div style="font-size:36px;margin-bottom:12px">'+icon+'</div>'
+      + '<div style="font-size:14px;font-weight:600;color:#1a1a2e">'+title+'</div>'
+      + '<div style="font-size:11px;margin-top:6px;color:#6c757d">'+sub+'</div>'
+      + '</div>';
+  };
+
+  setStatus('☁', 'Menghubungkan ke Firebase…', 'project: production-planner-aba2d', '#6c757d');
+
+  // Step 1: Init Firebase
+  let fbReady = false;
+  try {
+    fbReady = fbInit();
+  } catch(e) {
+    setStatus('⚠', 'Firebase gagal init', e.message, '#b71c1c');
+  }
+
+  if (!fbReady) {
+    setStatus('💾', 'Firebase offline — loading dari localStorage', 'Pastikan koneksi internet aktif', '#e65100');
+    setTimeout(function() {
+      persistLoad();
+      updatePersistStatus();
+      updateFbStatus('offline');
+      updateFbIndicator();
+      go(curPage);
+    }, 800);
+    return;
+  }
+
+  // Step 2: Check Firestore connectivity + data
+  setStatus('☁', 'Membaca data dari Firestore…', 'Mengambil master data, forecast, jadwal…', '#0d47a1');
+  try {
+    const snap = await fbDb.collection(FB_DOC_ROOT).doc('skus').get();
+
+    if (!snap.exists) {
+      // No data yet — use localStorage and push to Firebase
+      setStatus('💾', 'Firestore kosong — loading dari localStorage', 'Data lokal akan di-push ke Firebase…', '#e65100');
+      persistLoad();
+      updatePersistStatus();
+      updateFbIndicator();
+      go(curPage);
+      setTimeout(async function() {
+        setStatus('☁', 'Mengirim data lokal ke Firebase…', 'Mohon tunggu sebentar', '#0d47a1');
+        await fbAutoSyncAll();
+        updateFbIndicator();
+        go(curPage);
+      }, 500);
+      return;
+    }
+
+    // Data exists — load all from Firestore
+    const totalDocs = Object.keys(FB_KEY_MAP).length;
+    setStatus('☁', 'Memuat data dari Firestore…', '0 / '+totalDocs+' collections', '#0d47a1');
+
+    let loaded = 0;
+    const keys = Object.keys(FB_KEY_MAP);
+    for (const key of keys) {
+      loaded++;
+      setStatus('☁', 'Memuat data dari Firestore…',
+        loaded+' / '+keys.length+' · '+key, '#0d47a1');
+      const val = await fbRead(key);
+      if (val === null) continue;
+      applyFbData(key, val);
+      localStorage.setItem(PERSIST_KEYS[key]||('ppic_'+key.toLowerCase()), JSON.stringify(val));
+    }
+
+    localStorage.setItem('fb_last_pull', new Date().toLocaleTimeString('id-ID'));
+    updateFbStatus('connected');
+    updateFbIndicator();
+    setStatus('✓', 'Data berhasil dimuat dari Firebase', 'Membuka dashboard…', '#1b5e20');
+    setTimeout(function() { go(curPage); }, 500);
+
+  } catch(e) {
+    const msg = e.message || String(e);
+    const isPermission = msg.includes('permission') || msg.includes('PERMISSION');
+    setStatus('✗',
+      isPermission ? 'Firestore Rules belum diset' : 'Error membaca Firestore',
+      isPermission
+        ? 'Buka Firebase Console → Firestore → Rules → set allow read, write: if true → Publish'
+        : msg,
+      '#b71c1c');
+    updateFbStatus('error', msg);
+    // Fallback to localStorage after delay
+    setTimeout(function() {
+      persistLoad();
+      updatePersistStatus();
+      updateFbIndicator();
+      go(curPage);
+    }, 3000);
+  }
+}
+
+// Apply data from Firestore to runtime variables
+function applyFbData(key, val) {
+  switch(key) {
+    case 'SKUS':             SKUS.splice(0,SKUS.length,...(Array.isArray(val)?val:[])); break;
+    case 'RES_FG_DATA':      RES_FG_DATA.splice(0,RES_FG_DATA.length,...(Array.isArray(val)?val:[])); break;
+    case 'RES_SF_DATA':      RES_SF_DATA.splice(0,RES_SF_DATA.length,...(Array.isArray(val)?val:[])); break;
+    case 'BOM_DATA':         BOM_DATA.splice(0,BOM_DATA.length,...(Array.isArray(val)?val:[])); break;
+    case 'FC_DATA':          FC_DATA.splice(0,FC_DATA.length,...(Array.isArray(val)?val:[])); break;
+    case 'SCHED_ROWS':       SCHED_ROWS.splice(0,SCHED_ROWS.length,...(Array.isArray(val)?val:[])); break;
+    case 'SCHED_MIX_ROWS':   SCHED_MIX_ROWS.splice(0,SCHED_MIX_ROWS.length,...(Array.isArray(val)?val:[])); break;
+    case 'API_CONNECTIONS':  API_CONNECTIONS.splice(0,API_CONNECTIONS.length,...(Array.isArray(val)?val:[])); break;
+    case 'GBJD_STOCK':       Object.keys(val||{}).forEach(function(k){GBJD_STOCK[k]=val[k];}); break;
+    case 'WORK_HOURS':       Object.keys(val||{}).forEach(function(k){if(WORK_HOURS[k])Object.assign(WORK_HOURS[k],val[k]);}); break;
+    case 'OT_CONFIG':        Object.assign(OT_CONFIG, val||{}); break;
+    case 'projVersionPerSku':Object.assign(projVersionPerSku, val||{}); break;
+    case 'FG_WIP_MAP':       Object.assign(FG_WIP_MAP, val||{}); break;
+    case 'PLAN_STOCK':       Object.assign(PLAN_STOCK, val||{}); break;
+    case 'SUGGEST_PENDING':  SUGGEST_PENDING.splice(0,SUGGEST_PENDING.length,...(Array.isArray(val)?val:[])); break;
+  }
+}
+
+
+// Silent load from Firebase (no confirm dialog, no alert)
+async function fbLoadAllSilent() {
+  const keys = Object.keys(FB_KEY_MAP);
+  for (const key of keys) {
+    const val = await fbRead(key);
+    if (val === null) continue;
+    applyFbData(key, val);
+    localStorage.setItem(PERSIST_KEYS[key]||('ppic_'+key.toLowerCase()), JSON.stringify(val));
+  }
+  localStorage.setItem('fb_last_pull', new Date().toLocaleTimeString('id-ID'));
+  updateFbStatus('connected');
+}
+
+// Push all current data to Firebase (background)
+async function fbAutoSyncAll() {
+  const dataMap = {
+    SKUS, RES_FG_DATA, RES_SF_DATA, BOM_DATA, FC_DATA,
+    GBJD_STOCK, SCHED_ROWS, SCHED_MIX_ROWS, WORK_HOURS, OT_CONFIG,
+    API_CONNECTIONS, projVersionPerSku, FG_WIP_MAP, PLAN_STOCK, SUGGEST_PENDING,
+  };
+  for (const [key, val] of Object.entries(dataMap)) {
+    await fbWrite(key, val);
+  }
+  localStorage.setItem('fb_last_push', new Date().toLocaleTimeString('id-ID'));
+  updateFbIndicator();
+}
+
+startupLoad();
 
 // ═══════════════════════════════════════════
 // FORECAST DATA & STATE
@@ -5416,7 +5846,7 @@ function detectJadwalStartDate(rows) {
   }
 })();
 
-go('proj');
+// startupLoad() handles go(curPage) and fbInit()
 </script>
 </body>
 </html>
